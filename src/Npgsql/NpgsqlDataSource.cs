@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Data.Common;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.IdentityModel.Tokens.Jwt;
 using System.Net.Security;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
@@ -282,13 +283,59 @@ public abstract class NpgsqlDataSource : DbDataSource
         return _password;
     }
 
+    /// <summary>
+    /// Returns a value indicating that the next <see cref="_passwordProviderTimer"/> triggers prematurely because the JWT access token expire before the next <see cref="_passwordProviderTimer"/> is triggered
+    /// </summary>
+    /// <param name="token">A 'JSON Web Token' (JWT) in JWS or JWE Compact Serialization Format.</param>
+    /// <param name="prematureTokenRefresh">A <see cref="TimeSpan"/> representing the amount of time that the <see cref="_passwordProviderTimer"/> is triggered before the expiration of the <paramref name="token"/> expires.</param>
+    /// <returns>true if the <paramref name="token"/>s expiration time is set as next <see cref="_passwordProviderTimer"/> trigger, false otherwise.</returns>
+    bool TrySetPrematurePasswordRefreshAccordingJwtExpiration(string token, TimeSpan prematureTokenRefresh)
+    {
+        try
+        {
+            var handler = new JwtSecurityTokenHandler();
+            var jwtToken = handler.ReadJwtToken(token);
+
+            if (jwtToken.ValidTo > DateTime.MinValue)
+            {
+                var diff = jwtToken.ValidTo - DateTime.UtcNow;
+
+                if (diff > _periodicPasswordSuccessRefreshInterval)
+                {
+                    //if lifetime of token is longer than the periodic refresh interval than no premature token refresh should be performed
+                    return false;
+                }
+
+                if (diff > prematureTokenRefresh) // premature token refresh
+                {
+                    diff -= prematureTokenRefresh;
+                }
+
+                _connectionLogger.LogWarning("Database access token expires before the next periodicPasswordSuccessRefreshInterval is triggered. Therefore the expiration time of the access token is used as next password refresh interval");
+                _passwordProviderTimer!.Change(diff, Timeout.InfiniteTimeSpan);
+
+                return true;
+            }
+
+            return false;
+        }
+        catch (Exception)
+        {
+            // token is no valid JWT
+            return false;
+        }
+    }
+
     async Task RefreshPassword()
     {
         try
         {
             _password = await _periodicPasswordProvider!(Settings, _timerPasswordProviderCancellationTokenSource!.Token);
 
-            _passwordProviderTimer!.Change(_periodicPasswordSuccessRefreshInterval, Timeout.InfiniteTimeSpan);
+            if (!TrySetPrematurePasswordRefreshAccordingJwtExpiration(_password, TimeSpan.FromMinutes(5)))
+            {
+                _passwordProviderTimer!.Change(_periodicPasswordSuccessRefreshInterval, Timeout.InfiniteTimeSpan);
+            }
         }
         catch (Exception e)
         {
@@ -338,7 +385,7 @@ public abstract class NpgsqlDataSource : DbDataSource
         Debug.Assert(this is not NpgsqlMultiHostDataSource);
 
         var databaseStateInfo = _databaseStateInfo;
-        
+
         if (!ignoreTimeStamp && timeStamp <= databaseStateInfo.TimeStamp)
             return _databaseStateInfo.State;
 
@@ -433,7 +480,7 @@ public abstract class NpgsqlDataSource : DbDataSource
     }
 
     #endregion
-    
+
     class DatabaseStateInfo
     {
         internal readonly DatabaseState State;
@@ -442,7 +489,7 @@ public abstract class NpgsqlDataSource : DbDataSource
         internal readonly DateTime TimeStamp;
 
         public DatabaseStateInfo() : this(default, default, default) {}
-        
+
         public DatabaseStateInfo(DatabaseState state, NpgsqlTimeout timeout, DateTime timeStamp)
             => (State, Timeout, TimeStamp) = (state, timeout, timeStamp);
     }
